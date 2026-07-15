@@ -11,6 +11,8 @@ from natsort import natsorted
 
 import genoray._core as _core
 from genoray._contigs import _MITO_ALIASES
+from genoray._io import atomic_write_dir
+from genoray._progress import ProgressContext, _ConversionProgress
 from genoray._svar2_batch import _BatchQueryMixin
 from genoray._svar2_decode import _DecodeMixin
 from genoray._svar2_fields import (
@@ -24,11 +26,12 @@ from genoray._svar2_mutcat import _MutcatMixin
 from genoray._svar2_ops import Mode, _assert_concat_compatible, _load_meta, _write_store
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from numpy.typing import NDArray
 
     from genoray._svar2_fields import FormatField, InfoField
+    from genoray._progress import ProgressCallback
 
 
 def _resolve_vcf_sources(sources: "str | Path | Sequence[str | Path]") -> list[Path]:
@@ -487,6 +490,10 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         signatures: bool = False,
         info_fields: Sequence[str | InfoField] | None = None,
         format_fields: Sequence[str | FormatField] | None = None,
+        progress: bool = False,
+        progress_callback: "ProgressCallback | None" = None,
+        progress_path: str | Path | None = None,
+        progress_identity: "Mapping[str, object] | None" = None,
     ) -> int:
         """Convert a bgzipped VCF or BCF to an SVAR2 store.
 
@@ -509,6 +516,14 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         otherwise a reserved sentinel/NaN is written. FORMAT fields are
         genotype-aligned: non-carrier values are dropped for var_key-routed
         variants.
+
+        progress: display a native progress bar. ``progress_callback`` receives
+        the same structured :class:`genoray._progress.ProgressEvent` objects,
+        and ``progress_path`` atomically stores the latest event as JSON. The
+        callback and display can be enabled together. ``progress_identity``
+        overrides identity fields read from ``NF_SEQLAB_PROGRESS_*`` variables.
+        The snapshot path must be outside ``out`` so conversion rollback cannot
+        create or mutate the atomically published store.
         """
         from cyvcf2 import VCF as _CyVCF
 
@@ -541,21 +556,38 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         flds = _resolve_fields(str(source), info_fields, format_fields)
         info = [t for t in flds if t[1] == "info"]
         format_ = [t for t in flds if t[1] == "format"]
-        return _core.run_conversion_pipeline(
-            str(source),
-            reference_path,
-            contigs,
-            str(out),
-            samples,
-            chunk_size,
-            ploidy,
-            threads,  # max_threads; None => auto
-            long_allele_capacity,
-            skip_out_of_scope,
-            signatures,
-            info,
-            format_,
+        progress_context = ProgressContext(
+            "svar2.from_vcf",
+            callback=progress_callback,
+            snapshot_path=progress_path,
+            identity=progress_identity,
+            display=progress,
         )
+        progress_context.validate_snapshot_outside(out)
+        reporter = _ConversionProgress(progress_context, contigs)
+        with progress_context:
+            reporter.start()
+            with atomic_write_dir(out) as staging:
+                dropped = _core.run_conversion_pipeline(
+                    str(source),
+                    reference_path,
+                    contigs,
+                    str(staging),
+                    samples,
+                    chunk_size,
+                    ploidy,
+                    threads,  # max_threads; None => auto
+                    long_allele_capacity,
+                    skip_out_of_scope,
+                    signatures,
+                    info,
+                    format_,
+                    reporter.callback,
+                )
+                reporter.finalized()
+                reporter.publishing()
+            reporter.complete()
+        return dropped
 
     @classmethod
     def from_pgen(
@@ -687,6 +719,10 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         signatures: bool = False,
         info_fields: "Sequence[str | InfoField] | None" = None,
         format_fields: "Sequence[str | FormatField] | None" = None,
+        progress: bool = False,
+        progress_callback: "ProgressCallback | None" = None,
+        progress_path: str | Path | None = None,
+        progress_identity: "Mapping[str, object] | None" = None,
     ) -> int:
         """Build one SVAR2 store from many **single-sample** VCFs/BCFs via a
         native k-way merge (no `bcftools merge`, no intermediate multi-sample
@@ -766,6 +802,10 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
 
         Returns the number of out-of-scope (symbolic/breakend) ALTs dropped
         (0 unless `skip_out_of_scope`).
+
+        ``progress``/``progress_callback``/``progress_path``/
+        ``progress_identity`` have the same structured-progress semantics as
+        :meth:`from_vcf`, including requiring snapshots to live outside ``out``.
         """
         from cyvcf2 import VCF as _CyVCF
 
@@ -821,21 +861,38 @@ class SparseVar2(_BatchQueryMixin, _DecodeMixin, _MutcatMixin):
         info = [t for t in flds if t[1] == "info"]
         format_ = [t for t in flds if t[1] == "format"]
 
-        return _core.run_vcf_list_conversion_pipeline(
-            [str(p) for p in paths],
-            None if no_reference else str(reference),
-            contigs,
-            str(out),
-            samples,
-            chunk_size,
-            ploidy,
-            threads,
-            long_allele_capacity,
-            skip_out_of_scope,
-            signatures,
-            info,
-            format_,
+        progress_context = ProgressContext(
+            "svar2.from_vcf_list",
+            callback=progress_callback,
+            snapshot_path=progress_path,
+            identity=progress_identity,
+            display=progress,
         )
+        progress_context.validate_snapshot_outside(out)
+        reporter = _ConversionProgress(progress_context, contigs)
+        with progress_context:
+            reporter.start()
+            with atomic_write_dir(out) as staging:
+                dropped = _core.run_vcf_list_conversion_pipeline(
+                    [str(p) for p in paths],
+                    None if no_reference else str(reference),
+                    contigs,
+                    str(staging),
+                    samples,
+                    chunk_size,
+                    ploidy,
+                    threads,
+                    long_allele_capacity,
+                    skip_out_of_scope,
+                    signatures,
+                    info,
+                    format_,
+                    reporter.callback,
+                )
+                reporter.finalized()
+                reporter.publishing()
+            reporter.complete()
+        return dropped
 
     @classmethod
     def from_svar1(
