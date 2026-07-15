@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import threading
 from pathlib import Path
 
 import polars as pl
@@ -57,6 +58,38 @@ def test_atomic_write_dir_overwrite_replaces(tmp_path: Path):
     assert [p.name for p in tmp_path.iterdir()] == ["out.svar"]
 
 
+def test_atomic_write_dir_no_overwrite_rechecks_at_publication(tmp_path: Path):
+    dest = tmp_path / "out.svar"
+    ready = threading.Barrier(2)
+    publish = threading.Event()
+    outcomes: list[str] = []
+
+    def writer(name: str) -> None:
+        try:
+            with atomic_write_dir(dest, overwrite=False) as staging:
+                (staging / "writer.txt").write_text(name)
+                ready.wait()
+                if name == "second":
+                    publish.wait()
+            outcomes.append(f"{name}:published")
+            if name == "first":
+                publish.set()
+        except FileExistsError:
+            outcomes.append(f"{name}:rejected")
+
+    first = threading.Thread(target=writer, args=("first",))
+    second = threading.Thread(target=writer, args=("second",))
+    second.start()
+    first.start()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert sorted(outcomes) == ["first:published", "second:rejected"]
+    assert (dest / "writer.txt").read_text() == "first"
+
+
 def test_atomic_write_dir_failure_preserves_existing(tmp_path: Path):
     dest = tmp_path / "out.svar"
     dest.mkdir()
@@ -93,6 +126,37 @@ def test_atomic_write_dir_rollback_on_swap_failure(tmp_path: Path, monkeypatch):
     assert (dest / "old.bin").read_bytes() == b"OLD"  # rolled back
     assert not (dest / "new.bin").exists()
     assert [p.name for p in tmp_path.iterdir()] == ["out.svar"]
+
+
+def test_atomic_write_dir_preserves_backup_when_rollback_fails(
+    tmp_path: Path, monkeypatch
+):
+    dest = tmp_path / "out.svar"
+    dest.mkdir()
+    (dest / "old.bin").write_bytes(b"OLD")
+
+    real_replace = os.replace
+    calls = {"n": 0}
+
+    def flaky_replace(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("publish boom")
+        if calls["n"] == 3:
+            raise OSError("rollback boom")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(U.os, "replace", flaky_replace)
+
+    with pytest.raises(OSError, match="rollback boom"):
+        with atomic_write_dir(dest) as staging:
+            (staging / "new.bin").write_bytes(b"NEW")
+
+    assert not dest.exists()
+    backups = list(tmp_path.glob(".out.svar.old.*"))
+    assert len(backups) == 1
+    assert (backups[0] / "old.bin").read_bytes() == b"OLD"
+    assert not (backups[0] / "new.bin").exists()
 
 
 def _raise_boom(*args, **kwargs):

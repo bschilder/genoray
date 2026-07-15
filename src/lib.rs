@@ -3,6 +3,8 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 #[cfg(feature = "conversion")]
 use rayon::prelude::*;
+#[cfg(feature = "conversion")]
+use std::sync::Arc;
 
 pub mod bits;
 
@@ -95,6 +97,40 @@ pub mod writer;
 #[cfg(feature = "conversion")]
 pub use orchestrator::process_chromosome;
 
+#[cfg(feature = "conversion")]
+fn make_contig_progress_callback(
+    callback: Option<Py<PyAny>>,
+) -> Option<orchestrator::ContigProgressCallback> {
+    callback.map(|callback| {
+        Arc::new(move |chrom: &str| {
+            Python::attach(|py| {
+                callback.call1(py, (chrom,)).map(|_| ()).map_err(|error| {
+                    crate::error::ConversionError::Input(format!(
+                        "progress callback failed: {error}"
+                    ))
+                })
+            })
+        }) as orchestrator::ContigProgressCallback
+    })
+}
+
+#[cfg(feature = "conversion")]
+fn make_finalizing_progress_callback(
+    callback: Option<Py<PyAny>>,
+) -> Option<orchestrator::FinalizingProgressCallback> {
+    callback.map(|callback| {
+        Arc::new(move || {
+            Python::attach(|py| {
+                callback.call0(py).map(|_| ()).map_err(|error| {
+                    crate::error::ConversionError::Input(format!(
+                        "progress callback failed: {error}"
+                    ))
+                })
+            })
+        }) as orchestrator::FinalizingProgressCallback
+    })
+}
+
 /// Build a `.csi` index next to a bgzipped-VCF / BCF at `path`. CSI (min_shift 14)
 /// is valid for both, so one path covers `.vcf.gz` and `.bcf`.
 #[cfg(feature = "conversion")]
@@ -120,7 +156,7 @@ fn index_vcf(path: String) -> PyResult<()> {
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), region_ranges=Vec::new()))]
+#[pyo3(signature = (vcf_path, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), region_ranges=Vec::new(), progress_callback=None, finalizing_callback=None))]
 fn run_conversion_pipeline(
     py: Python,
     vcf_path: String,
@@ -137,6 +173,8 @@ fn run_conversion_pipeline(
     info_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
     format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
     region_ranges: Vec<(String, u32, u32)>,
+    progress_callback: Option<Py<PyAny>>,
+    finalizing_callback: Option<Py<PyAny>>,
 ) -> PyResult<usize> {
     let sample_refs: Vec<&str> = samples.iter().map(|s| s.as_str()).collect();
 
@@ -144,6 +182,8 @@ fn run_conversion_pipeline(
     raw.extend(format_fields);
     let fields =
         crate::field::parse_manifest(raw).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let progress_callback = make_contig_progress_callback(progress_callback);
+    let finalizing_callback = make_finalizing_progress_callback(finalizing_callback);
 
     let mut ranges_by_chrom: std::collections::HashMap<String, Vec<(u32, u32)>> =
         std::collections::HashMap::new();
@@ -200,7 +240,7 @@ fn run_conversion_pipeline(
                 .par_iter()
                 .map(|chrom| {
                     println!("==> Processing {}", chrom);
-                    orchestrator::process_chromosome(
+                    let dropped = orchestrator::process_chromosome(
                         orchestrator::SourceSpec::Vcf {
                             vcf_path: vcf_path.clone(),
                             htslib_threads,
@@ -217,7 +257,11 @@ fn run_conversion_pipeline(
                         processing_threads,
                         signatures,
                         &fields,
-                    )
+                    )?;
+                    if let Some(callback) = &progress_callback {
+                        callback(chrom)?;
+                    }
+                    Ok(dropped)
                 })
                 .collect::<Vec<_>>()
         });
@@ -229,6 +273,10 @@ fn run_conversion_pipeline(
     let mut total_dropped: u64 = 0;
     for r in results {
         total_dropped += r?; // ConversionError -> PyErr via From (category-aware)
+    }
+
+    if let Some(callback) = &finalizing_callback {
+        callback()?;
     }
 
     // All contigs staged — resolve each field's global on-disk dtype and
@@ -789,7 +837,7 @@ fn svar2_variant_stats<'py>(
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::type_complexity)]
 #[pyfunction]
-#[pyo3(signature = (vcf_paths, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new()))]
+#[pyo3(signature = (vcf_paths, reference_path, chroms, output_dir, samples, chunk_size=25_000, ploidy=2, max_threads=None, long_allele_capacity=8_388_608, skip_out_of_scope=false, signatures=false, info_fields=Vec::new(), format_fields=Vec::new(), progress_callback=None, finalizing_callback=None))]
 fn run_vcf_list_conversion_pipeline(
     py: Python,
     vcf_paths: Vec<String>,
@@ -805,9 +853,13 @@ fn run_vcf_list_conversion_pipeline(
     signatures: bool,
     info_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
     format_fields: Vec<(String, String, String, Option<String>, Option<f64>)>,
+    progress_callback: Option<Py<PyAny>>,
+    finalizing_callback: Option<Py<PyAny>>,
 ) -> PyResult<usize> {
+    let progress_callback = make_contig_progress_callback(progress_callback);
+    let finalizing_callback = make_finalizing_progress_callback(finalizing_callback);
     let dropped: u64 = py.detach(|| {
-        orchestrator::run_vcf_list(
+        orchestrator::run_vcf_list_with_progress(
             &vcf_paths,
             reference_path.as_deref(),
             &chroms,
@@ -821,6 +873,8 @@ fn run_vcf_list_conversion_pipeline(
             signatures,
             info_fields,
             format_fields,
+            progress_callback.as_ref(),
+            finalizing_callback.as_ref(),
         )
     })?;
     Ok(dropped as usize)
