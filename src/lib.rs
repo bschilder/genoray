@@ -214,6 +214,7 @@ fn run_conversion_pipeline(
         let plan = crate::budget::plan_thread_budget(available_cores, chroms.len());
         let concurrent_chroms = plan.concurrent_chroms;
         let htslib_threads = plan.htslib_threads;
+        let shard_workers = plan.shard_workers;
         let processing_threads = plan.processing_threads;
 
         let total_active =
@@ -221,8 +222,9 @@ fn run_conversion_pipeline(
         println!("Using: {} cores.", available_cores);
         println!(
             "Pipeline Config: {} concurrent chromosomes | {} HTSlib decompression threads each \
-             ({} pipeline/BGZF threads, {} reader-side processing/shard threads).",
-            concurrent_chroms, htslib_threads, total_active, processing_threads,
+             ({} pipeline/BGZF threads, {} normalization/packing threads, {} variant-shard \
+             workers when sharding replaces HTSlib).",
+            concurrent_chroms, htslib_threads, total_active, processing_threads, shard_workers,
         );
 
         // Step 2 -> Rayon Pool
@@ -247,6 +249,7 @@ fn run_conversion_pipeline(
                         orchestrator::SourceSpec::Vcf {
                             vcf_path: vcf_path.clone(),
                             htslib_threads,
+                            shard_workers,
                             regions: ranges_by_chrom.get(chrom).cloned().unwrap_or_default(),
                         },
                         fasta_ref,
